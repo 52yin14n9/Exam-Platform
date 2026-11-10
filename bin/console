@@ -1,0 +1,164 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+require dirname(__DIR__) . '/app/bootstrap.php';
+
+use App\Core\Database;
+use App\Core\KeyManager;
+
+$command = $argv[1] ?? 'help';
+if (!in_array($command, ['secrets:generate', 'diagnose'], true)) KeyManager::assertConfiguration();
+
+if ($command === 'diagnose') {
+    $failures = 0;
+    $line = static function (string $name, bool $ok, string $detail = '') use (&$failures): void {
+        if (!$ok) $failures++;
+        fwrite(STDOUT, sprintf("[%s] %s%s\n", $ok ? 'OK' : '失败', $name, $detail === '' ? '' : "：{$detail}"));
+    };
+    $line('PHP 版本', version_compare(PHP_VERSION, '8.2.0', '>='), PHP_VERSION);
+    foreach (['pdo_mysql','gd','fileinfo','mbstring','json','session'] as $extension) {
+        $line("扩展 {$extension}", extension_loaded($extension));
+    }
+    $line('.env 可读', is_readable(dirname(__DIR__) . '/.env'));
+    $studentSecret = (string) \App\Core\Config::get('keys.student_secret');
+    $adminSecret = (string) \App\Core\Config::get('keys.admin_secret');
+    $line('学生 Secret', strlen($studentSecret) >= 32, '长度=' . strlen($studentSecret) . '，指纹=' . substr(hash('sha256', $studentSecret), 0, 12));
+    $line('管理员 Secret', strlen($adminSecret) >= 64, '长度=' . strlen($adminSecret) . '，指纹=' . substr(hash('sha256', $adminSecret), 0, 12));
+    $line('两套 Secret 相互独立', $studentSecret !== '' && $adminSecret !== '' && !hash_equals($studentSecret, $adminSecret));
+    $uploadDir = (string) \App\Core\Config::get('upload.dir');
+    $line('上传目录可写', is_dir($uploadDir) && is_writable($uploadDir), $uploadDir);
+    try {
+        $pdo = Database::connection();
+        $line('数据库连接', true, (string) $pdo->query('SELECT VERSION()')->fetchColumn());
+        $required = ['admins','admin_access_keys','students','student_access_keys','audit_logs','assessment_questions','practice_questions','study_rounds','study_round_items','student_question_progress','student_question_answers'];
+        $tables = $pdo->query('SHOW TABLES')->fetchAll(PDO::FETCH_COLUMN);
+        foreach ($required as $table) $line("数据表 {$table}", in_array($table, $tables, true));
+        foreach (['admins','students'] as $table) {
+            if (!in_array($table, $tables, true)) continue;
+            $columns = $pdo->query("SHOW COLUMNS FROM {$table}")->fetchAll(PDO::FETCH_COLUMN);
+            $line("{$table}.session_version", in_array('session_version', $columns, true));
+        }
+        if (in_array('admin_access_keys', $tables, true)) {
+            $count = (int) $pdo->query('SELECT COUNT(*) FROM admin_access_keys k JOIN admins a ON a.id=k.admin_id WHERE k.revoked_at IS NULL AND a.status="active"')->fetchColumn();
+            $line('有效管理员 Key 记录', $count > 0, "数量={$count}");
+        }
+    } catch (Throwable $error) {
+        $line('数据库检查', false, $error->getMessage());
+    }
+    exit($failures === 0 ? 0 : 1);
+}
+
+if ($command === 'self-test') {
+    require dirname(__DIR__) . '/tests/run.php';
+    exit(0);
+}
+
+if ($command === 'migrate') {
+    $pdo = Database::connection();
+    $pdo->exec('CREATE TABLE IF NOT EXISTS schema_migrations (migration VARCHAR(190) PRIMARY KEY, applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+    foreach (glob(dirname(__DIR__) . '/database/migrations/*.sql') as $file) {
+        $name = basename($file);
+        $check = $pdo->prepare('SELECT 1 FROM schema_migrations WHERE migration=?');
+        $check->execute([$name]);
+        if ($check->fetchColumn()) continue;
+        try {
+            $sql = (string) file_get_contents($file);
+            foreach (preg_split('/;\s*(?:\r?\n|$)/', $sql, -1, PREG_SPLIT_NO_EMPTY) ?: [] as $statement) {
+                $pdo->exec(trim($statement));
+            }
+            $pdo->prepare('INSERT INTO schema_migrations(migration) VALUES(?)')->execute([$name]);
+            fwrite(STDOUT, "Applied {$name}\n");
+        } catch (Throwable $e) {
+            throw $e;
+        }
+    }
+    exit(0);
+}
+
+if ($command === 'qbank:import') {
+    $pdo = Database::connection();
+    $csv = $argv[2] ?? (dirname(__DIR__) . '/database/2026_jiangsu_theory_questions.csv');
+    if (!is_file($csv) || !is_readable($csv)) { fwrite(STDERR, "题库 CSV 不存在或不可读：{$csv}\n"); exit(1); }
+    $adminId = (int)($argv[3] ?? 0);
+    if ($adminId < 1) $adminId = (int)$pdo->query('SELECT id FROM admins WHERE status="active" ORDER BY id LIMIT 1')->fetchColumn();
+    if ($adminId < 1) { fwrite(STDERR, "请先创建管理员，再导入题库。\n"); exit(1); }
+    $handle = fopen($csv, 'rb'); $header = fgetcsv($handle);
+    if ($header) $header[0] = ltrim((string)$header[0], "\xEF\xBB\xBF");
+    $expected = ['type','title','prompt','option_a','option_b','option_c','option_d','option_e','option_f','correct_answers','explanation','difficulty','tags','source_ref','source_order','section','chapter'];
+    if (!$header || array_map('strtolower', array_map('trim', $header)) !== $expected) { fclose($handle); fwrite(STDERR, "题库 CSV 表头不正确。\n"); exit(1); }
+    $exists = $pdo->prepare('SELECT id FROM practice_questions WHERE source_ref=? LIMIT 1');
+    $insert = $pdo->prepare('INSERT INTO practice_questions(question_type,title,prompt,options_json,correct_answers_json,explanation,difficulty,tags,status,source_ref,source_order,section,chapter,created_by) VALUES(?,?,?,?,?,?,?, ?,"active",?,?,?,?,?)');
+    $inserted=0;$skipped=0;$line=1;$pdo->beginTransaction();
+    try {
+        while (($row=fgetcsv($handle))!==false) {
+            $line++; if (count($row)!==count($expected)) throw new RuntimeException("第 {$line} 行列数不正确");
+            $d=array_combine($expected,$row);$type=strtolower(trim((string)$d['type']));
+            if(!in_array($type,['single','multiple','judge','fill'],true)) throw new RuntimeException("第 {$line} 行题型无效");
+            $sourceRef=trim((string)$d['source_ref']); if($sourceRef==='') throw new RuntimeException("第 {$line} 行 source_ref 为空");
+            $exists->execute([$sourceRef]); if($exists->fetchColumn()){ $skipped++; continue; }
+            if($type==='judge') $options=['T'=>'对','F'=>'错'];
+            elseif($type==='fill') $options=[];
+            else { $options=[]; foreach(['a','b','c','d','e','f'] as $letter){$v=trim((string)$d['option_'.$letter]);if($v!=='')$options[strtoupper($letter)]=$v;} if(count($options)<2) throw new RuntimeException("第 {$line} 行选择题选项不足"); }
+            $correct=trim((string)$d['correct_answers'])===''?[]:array_values(array_filter(array_map('trim',explode('|',(string)$d['correct_answers'])),static fn($v)=>$v!==''));
+            if($type==='judge'&&(count($correct)!==1||!in_array($correct[0],['T','F'],true))) throw new RuntimeException("第 {$line} 行判断题答案无效");
+            if(in_array($type,['single','multiple'],true)&&!$correct) throw new RuntimeException("第 {$line} 行选择题答案为空");
+            $insert->execute([$type,trim((string)$d['title']),trim((string)$d['prompt']),json_encode($options,JSON_UNESCAPED_UNICODE),json_encode($correct,JSON_UNESCAPED_UNICODE),trim((string)$d['explanation'])?:null,in_array($d['difficulty'],['easy','medium','hard'],true)?$d['difficulty']:'medium',trim((string)$d['tags'])?:null,$sourceRef,(int)$d['source_order'],trim((string)$d['section'])?:null,trim((string)$d['chapter'])?:null,$adminId]);
+            $inserted++;
+        }
+        fclose($handle);$pdo->commit();
+    } catch(Throwable $e) { if(is_resource($handle))fclose($handle);if($pdo->inTransaction())$pdo->rollBack();fwrite(STDERR,"导入失败：{$e->getMessage()}\n");exit(1); }
+    $rows=$pdo->query("SELECT question_type,COUNT(*) c FROM practice_questions WHERE source_ref LIKE '2026江苏密码竞赛题库/%' GROUP BY question_type")->fetchAll(PDO::FETCH_KEY_PAIR);
+    $targets=['single'=>490,'multiple'=>358,'judge'=>172,'fill'=>30];$ok=true;
+    foreach($targets as$type=>$target){$actual=(int)($rows[$type]??0);$pass=$actual===$target;$ok=$ok&&$pass;fwrite(STDOUT,sprintf("[%s] %-8s %d/%d\n",$pass?'OK':'失败',$type,$actual,$target));}
+    $total=array_sum(array_map('intval',$rows));$ok=$ok&&$total===1050;fwrite(STDOUT,"新增 {$inserted} 道，跳过已存在 {$skipped} 道；官方理论题总数 {$total}/1050。\n");exit($ok?0:1);
+}
+
+if ($command === 'admin:create') {
+    $pdo = Database::connection();
+    $name = trim($argv[2] ?? '系统管理员');
+    $existing = (int) $pdo->query('SELECT COUNT(*) FROM admins WHERE status="active"')->fetchColumn();
+    if ($existing > 0) {
+        fwrite(STDERR, "已存在有效管理员。若需轮换 Key，请运行 admin:rotate。\n");
+        exit(1);
+    }
+    $key = KeyManager::generateAdmin();
+    $pdo->beginTransaction();
+    try {
+        $pdo->prepare('INSERT INTO admins(display_name) VALUES(?)')->execute([$name]);
+        $id = (int) $pdo->lastInsertId();
+        $pdo->prepare('INSERT INTO admin_access_keys(admin_id,key_digest,key_hint) VALUES(?,?,?)')
+            ->execute([$id, KeyManager::digestAdmin($key), substr($key, -8)]);
+        $pdo->commit();
+    } catch (Throwable $e) {
+        $pdo->rollBack(); throw $e;
+    }
+    fwrite(STDOUT, "管理员 Key（仅显示一次，请立即保存）：\n{$key}\n");
+    exit(0);
+}
+
+if ($command === 'admin:rotate') {
+    $pdo = Database::connection();
+    $adminId = (int) ($argv[2] ?? 1);
+    $key = KeyManager::generateAdmin();
+    $pdo->beginTransaction();
+    try {
+        $pdo->prepare('UPDATE admin_access_keys SET revoked_at=UTC_TIMESTAMP() WHERE admin_id=? AND revoked_at IS NULL')->execute([$adminId]);
+        $pdo->prepare('UPDATE admins SET session_version=session_version+1 WHERE id=?')->execute([$adminId]);
+        $pdo->prepare('INSERT INTO admin_access_keys(admin_id,key_digest,key_hint) VALUES(?,?,?)')
+            ->execute([$adminId, KeyManager::digestAdmin($key), substr($key, -8)]);
+        $pdo->commit();
+    } catch (Throwable $e) {
+        $pdo->rollBack(); throw $e;
+    }
+    fwrite(STDOUT, "新管理员 Key（仅显示一次）：\n{$key}\n");
+    exit(0);
+}
+
+if ($command === 'secrets:generate') {
+    fwrite(STDOUT, "STUDENT_KEY_SECRET=" . bin2hex(random_bytes(32)) . "\n");
+    fwrite(STDOUT, "ADMIN_KEY_SECRET=" . bin2hex(random_bytes(64)) . "\n");
+    exit(0);
+}
+
+fwrite(STDOUT, "可用命令：\n  diagnose\n  self-test\n  migrate\n  qbank:import [CSV路径] [管理员ID]\n  secrets:generate\n  admin:create [名称]\n  admin:rotate [管理员ID]\n");
